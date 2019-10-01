@@ -12,14 +12,18 @@ namespace LoopHammer
         {
             var loopCount = 1000000;
 
-            Parallel.For(0, loopCount, i =>
+            // For some reason, with four parallel threads the issue is the most visible.
+            var maxDegreeOfParallelism = 4;
+            Console.WriteLine($"MaxDegreeOfParallelism: {maxDegreeOfParallelism}");
+
+            Parallel.For(0, loopCount, new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism }, i =>
             {
                 new DostuffHandler().Handle();
             });
         }
     }
 
-    public class DostuffHandler 
+    public class DostuffHandler
     {
         private string correlationId;
 
@@ -32,7 +36,7 @@ namespace LoopHammer
                  * For legacy reasons, we want to handle the transaction ourselves.
                  */
                 var transactionOptions = new TransactionOptions { IsolationLevel = IsolationLevel.ReadCommitted };
-                using (var transaction = new TransactionScope(TransactionScopeOption.Required, transactionOptions, TransactionScopeAsyncFlowOption.Enabled))
+                using (var transaction = new TransactionScope(TransactionScopeOption.Required, transactionOptions))
                 {
                     /*
                      * Since the above TransactionScope uses TransactionScopeOption.Required, we're in a new TransactionScope and @@trancount is 1 99.99% of the time
@@ -42,15 +46,13 @@ namespace LoopHammer
 
                     if (transactionDetails.TranCount != 1)
                     {
-                        Console.WriteLine("{0} trandetails is {1}, WE'RE ABOUT TO CREATE INCONSISTENT DATA", correlationId, transactionDetails);
+                        Console.WriteLine("{0} Trandetails is {1}, WE'RE ABOUT TO CREATE INCONSISTENT DATA", correlationId, transactionDetails);
                     }
 
                     /*
-                     * This writes to two different tables.
-                     * - TestTable2 is written within the current transaction. When @@trancount is 0, the insert is NOT rolled back when the TransactionScope is rolled back.
-                     * - TestTable3 is written to, Suppressing the transaction. This is basically just a log.
+                     * This write should always be rolled back as part of current TransactionScope.
+                     * But sometimes it isn't, and the data is persisted. Which introduces inconsistency.
                      */
-                    WriteLogToDatabase(GetTransactionDetails());
                     WriteImportantBusinessDataToDatabase($"This should not be committed ever, since the WCF call below always fails.", GetTransactionDetails());
 
                     /*
@@ -58,8 +60,7 @@ namespace LoopHammer
                      * It always throws exception, and in 99.9% of the messages handled, the insert in the method above is rolled back.
                      * But in some cases, the stuff is not rolled back. We can tell when that is about to happen, by looking at @@trancount. 
                      */
-                    var serviceClient = new Service1Client("WSHttpBinding_IService1");
-                    serviceClient.DoWork(correlationId);
+                    MakeTransactionalWcfCallThatThrows();
 
                     WriteImportantBusinessDataToDatabase($"We never reach this location", GetTransactionDetails());
 
@@ -70,7 +71,7 @@ namespace LoopHammer
             {
                 if (e.Message != "Dummy exception")
                 {
-                    Console.WriteLine("{0} {1}", correlationId, e.Message);
+                    Console.WriteLine("{0} {1}", correlationId, e);
                 }
             }
         }
@@ -102,27 +103,6 @@ namespace LoopHammer
 
             return transactionDetails;
         }
-        private void WriteLogToDatabase(TransactionDetails transactionDetails)
-        {
-            // Making sure we always commit this one.
-            using (new TransactionScope(TransactionScopeOption.Suppress))
-            {
-                using (var connection = new SqlConnection(System.Configuration.ConfigurationManager.ConnectionStrings["InconsistencyDemo"].ConnectionString))
-                {
-                    connection.Open();
-                    var query = @"INSERT INTO [dbo].[LogData] ([TranCount], [Xact] , [TranId], [CorrelationId]) VALUES (@trancount, @xact, @tranid, @correlationId)";
-
-                    using (var command = new SqlCommand(query, connection))
-                    {
-                        command.Parameters.AddWithValue("@trancount", transactionDetails.TranCount);
-                        command.Parameters.AddWithValue("@xact", transactionDetails.XactState);
-                        command.Parameters.AddWithValue("@tranid", transactionDetails.TranId);
-                        command.Parameters.AddWithValue("@correlationId", correlationId);
-                        command.ExecuteNonQuery();
-                    }
-                }
-            }
-        }
         private void WriteImportantBusinessDataToDatabase(string message, TransactionDetails transactionDetails)
         {
             // This will be committed when "select @@trancount" is 0.
@@ -137,6 +117,26 @@ namespace LoopHammer
                     command.Parameters.AddWithValue("@correlationId", correlationId);
                     command.ExecuteNonQuery();
                 }
+            }
+        }
+
+        private void MakeTransactionalWcfCallThatThrows()
+        {
+            Service1Client serviceClient = null;
+            try
+            {
+                serviceClient = new Service1Client("WSHttpBinding_IService1");
+                serviceClient.DoWork(correlationId);
+                serviceClient.Close();
+            }
+            catch (Exception)
+            {
+                if (serviceClient != null)
+                {
+                    serviceClient.Abort();
+                }
+
+                throw;
             }
         }
     }
