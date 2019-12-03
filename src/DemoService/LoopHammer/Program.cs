@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Data.SqlClient;
 using System.Threading.Tasks;
 using System.Transactions;
@@ -8,15 +9,21 @@ namespace LoopHammer
 {
     class Program
     {
+        private static IEnumerable<bool> Infinite()
+        {
+            while (true)
+            {
+                yield return true;
+            }
+        }
         static void Main(string[] args)
         {
-            var loopCount = 1000000;
 
             // For some reason, with four parallel threads the issue is the most visible.
             var maxDegreeOfParallelism = 4;
             Console.WriteLine($"MaxDegreeOfParallelism: {maxDegreeOfParallelism}");
 
-            Parallel.For(0, loopCount, new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism }, i =>
+            Parallel.ForEach(Infinite(), new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism }, i =>
             {
                 new DostuffHandler().Handle();
             });
@@ -53,6 +60,7 @@ namespace LoopHammer
                      * This write should always be rolled back as part of current TransactionScope.
                      * But sometimes it isn't, and the data is persisted. Which introduces inconsistency.
                      */
+                    WriteLogToDatabase(GetTransactionDetails());
                     WriteImportantBusinessDataToDatabase($"This should not be committed ever, since the WCF call below always fails.", GetTransactionDetails());
 
                     /*
@@ -102,6 +110,28 @@ namespace LoopHammer
             }
 
             return transactionDetails;
+        }
+
+        private void WriteLogToDatabase(TransactionDetails transactionDetails)
+        {
+            // Making sure we always commit this one.
+            using (new TransactionScope(TransactionScopeOption.Suppress))
+            {
+                using (var connection = new SqlConnection(System.Configuration.ConfigurationManager.ConnectionStrings["InconsistencyDemo"].ConnectionString))
+                {
+                    connection.Open();
+                    var query = @"INSERT INTO [dbo].[LogData] ([TranCount], [Xact] , [TranId], [CorrelationId]) VALUES (@trancount, @xact, @tranid, @correlationId)";
+
+                    using (var command = new SqlCommand(query, connection))
+                    {
+                        command.Parameters.AddWithValue("@trancount", transactionDetails.TranCount);
+                        command.Parameters.AddWithValue("@xact", transactionDetails.XactState);
+                        command.Parameters.AddWithValue("@tranid", transactionDetails.TranId);
+                        command.Parameters.AddWithValue("@correlationId", correlationId);
+                        command.ExecuteNonQuery();
+                    }
+                }
+            }
         }
         private void WriteImportantBusinessDataToDatabase(string message, TransactionDetails transactionDetails)
         {
