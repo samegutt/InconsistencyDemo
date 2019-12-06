@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Data.SqlClient;
-using System.Threading.Tasks;
+using System.Threading;
 using System.Transactions;
 using DemoService.WcfAgents;
 
@@ -19,14 +19,11 @@ namespace LoopHammer
         static void Main(string[] args)
         {
 
-            // For some reason, with four parallel threads the issue is the most visible.
-            var maxDegreeOfParallelism = 4;
-            Console.WriteLine($"MaxDegreeOfParallelism: {maxDegreeOfParallelism}");
 
-            Parallel.ForEach(Infinite(), new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism }, i =>
+            while (true)
             {
-                new DostuffHandler().Handle();
-            });
+                ThreadPool.QueueUserWorkItem((o) => new DostuffHandler().Handle());
+            }
         }
     }
 
